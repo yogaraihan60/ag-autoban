@@ -60,13 +60,22 @@ var pluginVersion = "0.1.0"
 // ─── State ────────────────────────────────────────────────────────────────────
 
 var store = newBanStore()
+var cfg = defaultConfig()
+
+type pluginConfig struct {
+	BanMode string // "disable", "scheduler", "both" (default: "both")
+}
+
+func defaultConfig() pluginConfig {
+	return pluginConfig{BanMode: "both"}
+}
 
 type banStore struct {
-	mu          sync.Mutex
-	state       banState
-	statePath   string
-	authDir     string
-	loaded      bool
+	mu        sync.Mutex
+	state     banState
+	statePath string
+	authDir   string
+	loaded    bool
 }
 
 type banState struct {
@@ -160,7 +169,9 @@ func (s *banStore) addBan(authKey, reason string, statusCode int, resetAt int64)
 	}
 	s.state.Bans[authKey] = entry
 	s.save()
-	s.setAuthFileDisabled(authKey, true)
+	if cfg.BanMode == "disable" || cfg.BanMode == "both" {
+		s.setAuthFileDisabled(authKey, true)
+	}
 }
 
 func (s *banStore) addInvalid(authKey, reason string, statusCode int) {
@@ -177,7 +188,9 @@ func (s *banStore) addInvalid(authKey, reason string, statusCode int) {
 	}
 	s.state.Invalids[authKey] = entry
 	s.save()
-	s.setAuthFileDisabled(authKey, true)
+	if cfg.BanMode == "disable" || cfg.BanMode == "both" {
+		s.setAuthFileDisabled(authKey, true)
+	}
 }
 
 func (s *banStore) clearBan(authKey string) {
@@ -284,8 +297,10 @@ func (s *banStore) releaseAll() int {
 		s.save()
 	}
 	s.mu.Unlock()
-	for _, key := range keys {
-		s.setAuthFileDisabled(key, false)
+	if count > 0 && (cfg.BanMode == "disable" || cfg.BanMode == "both") {
+		for _, key := range keys {
+			s.setAuthFileDisabled(key, false)
+		}
 	}
 	return count
 }
@@ -305,7 +320,7 @@ func (s *banStore) releaseOne(authKey string) bool {
 		s.save()
 	}
 	s.mu.Unlock()
-	if changed {
+	if changed && (cfg.BanMode == "disable" || cfg.BanMode == "both") {
 		s.setAuthFileDisabled(authKey, false)
 	}
 	return changed
@@ -412,9 +427,10 @@ type pluginMetadata struct {
 }
 
 type configField struct {
-	Name        string `json:"Name"`
-	Type        string `json:"Type"`
-	Description string `json:"Description"`
+	Name        string   `json:"Name"`
+	Type        string   `json:"Type"`
+	EnumValues  []string `json:"EnumValues,omitempty"`
+	Description string   `json:"Description"`
 }
 
 type capabilities struct {
@@ -579,11 +595,63 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 func cliproxyPluginShutdown() {
 }
 
+// ─── Config parsing ───────────────────────────────────────────────────────────
+
+func parseConfig(request []byte) {
+	c := defaultConfig()
+	var req lifecycleRequest
+	if len(request) > 0 {
+		if err := json.Unmarshal(request, &req); err != nil {
+			cfg = c
+			return
+		}
+	}
+	raw := lifecycleConfigYAML(req.ConfigYAML)
+	if len(raw) > 0 {
+		for _, line := range strings.Split(string(raw), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, ":") {
+				continue
+			}
+			key, value, _ := strings.Cut(line, ":")
+			key = strings.TrimSpace(key)
+			value = strings.TrimSpace(value)
+			value = strings.Trim(value, `"'`)
+			if i := strings.Index(value, " #"); i >= 0 {
+				value = strings.TrimSpace(value[:i])
+			}
+			if key == "ban_mode" {
+				switch strings.ToLower(value) {
+				case "disable", "scheduler", "both":
+					c.BanMode = strings.ToLower(value)
+				}
+			}
+		}
+	}
+	cfg = c
+}
+
+func lifecycleConfigYAML(raw json.RawMessage) []byte {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return []byte(text)
+	}
+	var b []byte
+	if err := json.Unmarshal(raw, &b); err == nil {
+		return b
+	}
+	return nil
+}
+
 // ─── Method dispatch ──────────────────────────────────────────────────────────
 
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case "plugin.register", "plugin.reconfigure":
+		parseConfig(request)
 		return okJSON(pluginRegisterResponse{
 			SchemaVersion: 1,
 			Metadata: pluginMetadata{
@@ -592,7 +660,9 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 				Author:           "neronet",
 				GitHubRepository: "https://github.com/yogaraihan60/ag-autoban",
 				Logo:             "",
-				ConfigFields:     []configField{},
+				ConfigFields: []configField{
+					{Name: "ban_mode", Type: "enum", EnumValues: []string{"both", "disable", "scheduler"}, Description: "How to handle banned accounts: both=disable auth file + scheduler filter (default), disable=only set disabled:true in auth JSON, scheduler=only filter in scheduler.pick"},
+				},
 			},
 			Capabilities: capabilities{
 				UsagePlugin:   true,
@@ -689,6 +759,9 @@ func handleUsage(rec usageRecord) []byte {
 
 func handleSchedulerPick(req schedulerPickRequest) ([]byte, error) {
 	if !isAntigravitySchedulerRequest(req) {
+		return okJSON(schedulerPickResponse{Handled: false}), nil
+	}
+	if cfg.BanMode == "disable" {
 		return okJSON(schedulerPickResponse{Handled: false}), nil
 	}
 	if len(req.Candidates) == 0 {
