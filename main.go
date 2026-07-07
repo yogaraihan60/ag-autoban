@@ -160,6 +160,7 @@ func (s *banStore) addBan(authKey, reason string, statusCode int, resetAt int64)
 	}
 	s.state.Bans[authKey] = entry
 	s.save()
+	s.setAuthFileDisabled(authKey, true)
 }
 
 func (s *banStore) addInvalid(authKey, reason string, statusCode int) {
@@ -176,6 +177,7 @@ func (s *banStore) addInvalid(authKey, reason string, statusCode int) {
 	}
 	s.state.Invalids[authKey] = entry
 	s.save()
+	s.setAuthFileDisabled(authKey, true)
 }
 
 func (s *banStore) clearBan(authKey string) {
@@ -204,6 +206,31 @@ func (s *banStore) authFileMTime(authKey string) int64 {
 		return 0
 	}
 	return info.ModTime().Unix()
+}
+
+func (s *banStore) setAuthFileDisabled(authKey string, disabled bool) {
+	if s.authDir == "" || authKey == "" {
+		return
+	}
+	path := filepath.Join(s.authDir, authKey)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return
+	}
+	current, _ := raw["disabled"].(bool)
+	if current == disabled {
+		return
+	}
+	raw["disabled"] = disabled
+	out, err := json.Marshal(raw)
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, out, 0644)
 }
 
 func (s *banStore) isActiveBan(authKey string) bool {
@@ -237,29 +264,34 @@ func (s *banStore) activeBans() []string {
 
 func (s *banStore) releaseAll() int {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	var keys []string
 	count := 0
-	for _, e := range s.state.Bans {
+	for key, e := range s.state.Bans {
 		if e.Active {
 			e.Active = false
+			keys = append(keys, key)
 			count++
 		}
 	}
-	for _, e := range s.state.Invalids {
+	for key, e := range s.state.Invalids {
 		if e.Active {
 			e.Active = false
+			keys = append(keys, key)
 			count++
 		}
 	}
 	if count > 0 {
 		s.save()
 	}
+	s.mu.Unlock()
+	for _, key := range keys {
+		s.setAuthFileDisabled(key, false)
+	}
 	return count
 }
 
 func (s *banStore) releaseOne(authKey string) bool {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	changed := false
 	if e, ok := s.state.Bans[authKey]; ok && e.Active {
 		e.Active = false
@@ -271,6 +303,10 @@ func (s *banStore) releaseOne(authKey string) bool {
 	}
 	if changed {
 		s.save()
+	}
+	s.mu.Unlock()
+	if changed {
+		s.setAuthFileDisabled(authKey, false)
 	}
 	return changed
 }
@@ -392,13 +428,20 @@ type lifecycleRequest struct {
 }
 
 type managementRegistrationResponse struct {
-	Routes []managementRoute `json:"routes,omitempty"`
+	Routes    []managementRoute `json:"routes,omitempty"`
+	Resources []resourceRoute   `json:"resources,omitempty"`
 }
 
 type managementRoute struct {
 	Method      string `json:"Method"`
 	Path        string `json:"Path"`
 	Description string `json:"Description,omitempty"`
+}
+
+type resourceRoute struct {
+	Path        string `json:"Path"`
+	Menu        string `json:"Menu"`
+	Description string `json:"Description"`
 }
 
 type managementRequest struct {
@@ -563,6 +606,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 			Routes: []managementRoute{
 				{Method: "GET", Path: "/plugins/ag-autoban/status", Description: "Current autoban state JSON."},
 				{Method: "POST", Path: "/plugins/ag-autoban/release", Description: "Release active autobans (all or selected)."},
+				{Method: "POST", Path: "/plugins/ag-autoban/ban", Description: "Manually ban an account."},
+			},
+			Resources: []resourceRoute{
+				{Path: "/dashboard", Menu: "AG Autoban", Description: "Antigravity account ban management dashboard."},
 			},
 		}), nil
 
@@ -712,10 +759,17 @@ func isAntigravitySchedulerRequest(req schedulerPickRequest) bool {
 // ─── management.handle ────────────────────────────────────────────────────────
 
 func handleManagement(req managementRequest) managementResponse {
+	if strings.HasPrefix(req.Path, "/v0/resource/plugins/"+pluginID+"/dashboard") {
+		return managementResponse{
+			StatusCode: http.StatusOK,
+			Headers:    map[string][]string{"content-type": {"text/html; charset=utf-8"}, "cache-control": {"no-store"}},
+			Body:       []byte(dashboardHTML),
+		}
+	}
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/status") {
 		st := store.snapshot()
 		data, _ := json.Marshal(map[string]any{
-			"bans":    st.Bans,
+			"bans":     st.Bans,
 			"invalids": st.Invalids,
 		})
 		return managementResponse{
@@ -723,6 +777,27 @@ func handleManagement(req managementRequest) managementResponse {
 			Headers:    map[string][]string{"content-type": {"application/json"}},
 			Body:       data,
 		}
+	}
+	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/ban") {
+		if !strings.EqualFold(req.Method, http.MethodPost) {
+			return jsonResponse(http.StatusMethodNotAllowed, map[string]any{"error": "method_not_allowed"})
+		}
+		var body struct {
+			Items []string `json:"items"`
+		}
+		if len(req.Body) > 0 {
+			if err := json.Unmarshal(req.Body, &body); err != nil {
+				return jsonResponse(http.StatusBadRequest, map[string]any{"error": "bad_request", "message": err.Error()})
+			}
+		}
+		banned := 0
+		for _, key := range body.Items {
+			if !store.isActiveBan(key) {
+				store.addBan(key, "manual ban", 0, 0)
+				banned++
+			}
+		}
+		return jsonResponse(http.StatusOK, map[string]any{"banned": banned})
 	}
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/release") {
 		if !strings.EqualFold(req.Method, http.MethodPost) {
