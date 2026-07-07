@@ -1,0 +1,12 @@
+# Built artifacts
+ag-autoban.so
+ag-autoban.dylib
+ag-autoban.dll
+ag-autoban.h
+
+# Go workspace
+vendor/
+
+# OS files
+.DS_Store
+Thumbs.db
