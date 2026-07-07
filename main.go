@@ -206,36 +206,9 @@ func (s *banStore) authFileMTime(authKey string) int64 {
 	return info.ModTime().Unix()
 }
 
-// expireAndReconcile removes expired bans and reconciles invalid auths whose
-// files have been replaced. Must be called with mu held.
-func (s *banStore) expireAndReconcile() {
-	now := time.Now().Unix()
-	changed := false
-	for _, entry := range s.state.Bans {
-		if entry.Active && entry.ResetAt > 0 && entry.ResetAt <= now {
-			entry.Active = false
-			changed = true
-		}
-	}
-	for key, entry := range s.state.Invalids {
-		if !entry.Active {
-			continue
-		}
-		currentMTime := s.authFileMTime(key)
-		if currentMTime > entry.AuthFileMTime {
-			entry.Active = false
-			changed = true
-		}
-	}
-	if changed {
-		s.save()
-	}
-}
-
 func (s *banStore) isActiveBan(authKey string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.expireAndReconcile()
 	if e, ok := s.state.Bans[authKey]; ok && e.Active {
 		return true
 	}
@@ -248,7 +221,6 @@ func (s *banStore) isActiveBan(authKey string) bool {
 func (s *banStore) activeBans() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.expireAndReconcile()
 	var keys []string
 	for key, e := range s.state.Bans {
 		if e.Active {
@@ -306,7 +278,6 @@ func (s *banStore) releaseOne(authKey string) bool {
 func (s *banStore) snapshot() banState {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.expireAndReconcile()
 	cp := banState{
 		Bans:    make(map[string]*banEntry, len(s.state.Bans)),
 		Invalids: make(map[string]*invalidEntry, len(s.state.Invalids)),
@@ -639,8 +610,7 @@ func handleUsage(rec usageRecord) []byte {
 	}
 
 	if !rec.Failed && status >= 200 && status < 400 {
-		store.clearBan(authKey)
-		return okJSON(map[string]any{"stored": true, "action": "cleared"})
+		return okJSON(map[string]any{"stored": true, "action": "noop"})
 	}
 
 	if !rec.Failed {

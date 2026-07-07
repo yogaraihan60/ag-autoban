@@ -11,20 +11,20 @@ The plugin registers three capabilities with CLIProxyAPI:
 | Capability | Method | Purpose |
 |---|---|---|
 | `usage_plugin` | `usage.handle` | Receives every completed request record. When an antigravity account returns 429 or 401/403, it is added to the ban table. Successful requests clear any prior ban. |
-| `scheduler` | `scheduler.pick` | Before each request, CLIProxyAPI asks the plugin to pick an auth candidate. The plugin filters out candidates matching active bans and returns the highest-priority remaining candidate. Expired bans (past `reset_at`) are auto-cleared on every call. |
+| `scheduler` | `scheduler.pick` | Before each request, CLIProxyAPI asks the plugin to pick an auth candidate. The plugin filters out candidates matching active bans and returns the highest-priority remaining candidate. Bans persist until manually released. |
 | `management_api` | `management.handle` | Exposes `GET /plugins/ag-autoban/status` and `POST /plugins/ag-autoban/release` for inspection and manual ban release. |
 
 ### 429 quota detection
 
 Antigravity 429 responses include a `Resets in NhNmNs` body. The plugin parses
-this to compute `reset_at` and stores it in `state.json`. The ban is
-automatically released when `now > reset_at`.
+this and records `reset_at` in `state.json` for informational purposes. The ban
+is **not** automatically released when `reset_at` passes — use the management
+API to manually release bans.
 
 ### 401/403 invalid grant detection
 
 If the response body contains `invalid_grant` or `invalid_token`, the account
-is banned until its auth JSON file is replaced (detected via file mtime
-change).
+is banned permanently until manually released.
 
 ## State
 
