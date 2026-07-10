@@ -69,8 +69,14 @@ const API = "/v0/management/plugins/ag-autoban";
 let bans = {}, invalids = {};
 
 function getAuthHeader() {
-  const m = document.cookie.match(/mgmt_key=([^;]+)/);
-  if (m) return "Bearer " + m[1];
+  try {
+    const raw = localStorage.getItem("cli-proxy-auth");
+    if (raw) {
+      const d = JSON.parse(raw);
+      const state = d.state || d;
+      if (state.managementKey) return "Bearer " + state.managementKey;
+    }
+  } catch(e) {}
   const params = new URLSearchParams(location.search);
   const key = params.get("key");
   if (key) return "Bearer " + key;

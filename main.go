@@ -832,6 +832,7 @@ func isAntigravitySchedulerRequest(req schedulerPickRequest) bool {
 // ─── management.handle ────────────────────────────────────────────────────────
 
 func handleManagement(req managementRequest) managementResponse {
+	// Resource route (not auth-gated by cliproxyapi)
 	if strings.HasPrefix(req.Path, "/v0/resource/plugins/"+pluginID+"/dashboard") {
 		return managementResponse{
 			StatusCode: http.StatusOK,
@@ -839,6 +840,7 @@ func handleManagement(req managementRequest) managementResponse {
 			Body:       []byte(dashboardHTML),
 		}
 	}
+	// Management API routes (auth-gated by cliproxyapi)
 	if strings.HasPrefix(req.Path, "/v0/management/plugins/"+pluginID+"/status") {
 		st := store.snapshot()
 		data, _ := json.Marshal(map[string]any{
