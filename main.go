@@ -834,10 +834,16 @@ func isAntigravitySchedulerRequest(req schedulerPickRequest) bool {
 func handleManagement(req managementRequest) managementResponse {
 	// Resource route (not auth-gated by cliproxyapi)
 	if strings.HasPrefix(req.Path, "/v0/resource/plugins/"+pluginID+"/dashboard") {
+		st := store.snapshot()
+		embedData, _ := json.Marshal(map[string]any{
+			"bans":     st.Bans,
+			"invalids": st.Invalids,
+		})
+		html := strings.Replace(dashboardHTML, "__DATA_PLACEHOLDER__", string(embedData), 1)
 		return managementResponse{
 			StatusCode: http.StatusOK,
 			Headers:    map[string][]string{"content-type": {"text/html; charset=utf-8"}, "cache-control": {"no-store"}},
-			Body:       []byte(dashboardHTML),
+			Body:       []byte(html),
 		}
 	}
 	// Management API routes (auth-gated by cliproxyapi)

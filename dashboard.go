@@ -66,9 +66,11 @@ tr:hover{background:#1a2744}
 <div class="toast" id="toast"></div>
 <script>
 const API = "/v0/management/plugins/ag-autoban";
+const __EMBEDDED_DATA__ = __DATA_PLACEHOLDER__;
 let bans = {}, invalids = {};
 
 function getAuthHeader() {
+  // Try localStorage (set by management panel if "remember password" is checked)
   try {
     const raw = localStorage.getItem("cli-proxy-auth");
     if (raw) {
@@ -77,9 +79,19 @@ function getAuthHeader() {
       if (state.managementKey) return "Bearer " + state.managementKey;
     }
   } catch(e) {}
+  // Try our own key storage
+  const saved = localStorage.getItem("ag-autoban-key");
+  if (saved) return "Bearer " + saved;
+  // Try URL param
   const params = new URLSearchParams(location.search);
   const key = params.get("key");
-  if (key) return "Bearer " + key;
+  if (key) { localStorage.setItem("ag-autoban-key", key); return "Bearer " + key; }
+  return "";
+}
+
+function promptForKey() {
+  const key = prompt("Enter management key to perform actions:");
+  if (key) { localStorage.setItem("ag-autoban-key", key); return "Bearer " + key; }
   return "";
 }
 
@@ -97,15 +109,23 @@ function showToast(msg, ok) {
 }
 
 async function loadData() {
-  try {
-    const r = await fetch(API + "/status", { headers: { "Authorization": getAuthHeader() } });
-    const d = await r.json();
-    bans = d.bans || {};
-    invalids = d.invalids || {};
-    render();
-  } catch(e) {
-    showToast("Failed to load: " + e.message, false);
+  const auth = getAuthHeader();
+  if (auth) {
+    try {
+      const r = await fetch(API + "/status", { headers: { "Authorization": auth } });
+      if (r.ok) {
+        const d = await r.json();
+        bans = d.bans || {};
+        invalids = d.invalids || {};
+        render();
+        return;
+      }
+    } catch(e) {}
   }
+  // Fallback to embedded data (injected at page render time)
+  bans = __EMBEDDED_DATA__.bans || {};
+  invalids = __EMBEDDED_DATA__.invalids || {};
+  render();
 }
 
 function render() {
@@ -157,12 +177,15 @@ function render() {
 }
 
 async function releaseOne(key) {
+  let auth = getAuthHeader();
+  if (!auth) { auth = promptForKey(); if (!auth) return; }
   try {
     const r = await fetch(API + "/release", {
       method: "POST",
-      headers: { "Authorization": getAuthHeader(), "Content-Type": "application/json" },
+      headers: { "Authorization": auth, "Content-Type": "application/json" },
       body: JSON.stringify({ scope: "selected", items: [key] })
     });
+    if (r.status === 401) { localStorage.removeItem("ag-autoban-key"); auth = promptForKey(); if (!auth) return; return releaseOne(key); }
     const d = await r.json();
     showToast("Released: " + (d.released || 0), true);
     loadData();
@@ -171,12 +194,15 @@ async function releaseOne(key) {
 
 async function releaseAll() {
   if (!confirm("Release ALL bans?")) return;
+  let auth = getAuthHeader();
+  if (!auth) { auth = promptForKey(); if (!auth) return; }
   try {
     const r = await fetch(API + "/release", {
       method: "POST",
-      headers: { "Authorization": getAuthHeader(), "Content-Type": "application/json" },
+      headers: { "Authorization": auth, "Content-Type": "application/json" },
       body: JSON.stringify({ scope: "all" })
     });
+    if (r.status === 401) { localStorage.removeItem("ag-autoban-key"); auth = promptForKey(); if (!auth) return; return releaseAll(); }
     const d = await r.json();
     showToast("Released: " + (d.released || 0), true);
     loadData();
