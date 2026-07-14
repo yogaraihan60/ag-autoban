@@ -84,11 +84,12 @@ type banState struct {
 }
 
 type banEntry struct {
-	Reason    string `json:"reason"`
-	BannedAt  int64  `json:"banned_at"`
-	ResetAt   int64  `json:"reset_at"`
-	Active    bool   `json:"active"`
-	StatusCode int   `json:"status_code"`
+	Reason     string   `json:"reason"`
+	BannedAt   int64    `json:"banned_at"`
+	ResetAt    int64    `json:"reset_at"`
+	Active     bool     `json:"active"`
+	StatusCode int      `json:"status_code"`
+	Models     []string `json:"models,omitempty"` // model-specific bans (429); empty = all models
 }
 
 type invalidEntry struct {
@@ -156,10 +157,46 @@ func (s *banStore) save() {
 
 // ─── Ban management ───────────────────────────────────────────────────────────
 
-func (s *banStore) addBan(authKey, reason string, statusCode int, resetAt int64) {
+func (s *banStore) addBan(authKey, reason string, statusCode int, resetAt int64, model string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now().Unix()
+
+	if statusCode == http.StatusTooManyRequests && model != "" {
+		// Model-specific ban: add model to existing entry or create new
+		if e, ok := s.state.Bans[authKey]; ok && e.Active {
+			for _, m := range e.Models {
+				if m == model {
+					// Already banned for this model, update reset if longer
+					if resetAt > e.ResetAt {
+						e.ResetAt = resetAt
+					}
+					s.save()
+					return
+				}
+			}
+			e.Models = append(e.Models, model)
+			if resetAt > e.ResetAt {
+				e.ResetAt = resetAt
+			}
+			e.BannedAt = now
+			s.save()
+			return
+		}
+		s.state.Bans[authKey] = &banEntry{
+			Reason:     reason,
+			BannedAt:   now,
+			ResetAt:    resetAt,
+			Active:     true,
+			StatusCode: statusCode,
+			Models:     []string{model},
+		}
+		s.save()
+		// Don't disable auth file for model-specific bans — account can still serve other models
+		return
+	}
+
+	// Account-wide ban (manual, or non-model-specific)
 	entry := &banEntry{
 		Reason:     reason,
 		BannedAt:   now,
@@ -258,6 +295,52 @@ func (s *banStore) isActiveBan(authKey string) bool {
 	return false
 }
 
+func normalizeModelBan(model string) string {
+	model = strings.ToLower(strings.TrimSpace(model))
+	// Claude models share the same quota — ban by prefix
+	if strings.HasPrefix(model, "claude-") {
+		return "claude-*"
+	}
+	// Gemini models share the same quota
+	if strings.HasPrefix(model, "gemini-") {
+		return "gemini-*"
+	}
+	return model
+}
+
+func modelBanMatches(bannedModel, requestModel string) bool {
+	bannedModel = strings.ToLower(strings.TrimSpace(bannedModel))
+	requestModel = strings.ToLower(strings.TrimSpace(requestModel))
+	if strings.HasSuffix(bannedModel, "-*") {
+		prefix := strings.TrimSuffix(bannedModel, "-*")
+		return strings.HasPrefix(requestModel, prefix)
+	}
+	return bannedModel == requestModel
+}
+
+func (s *banStore) isBannedForModel(authKey, model string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// Invalids (401/403) are always account-wide
+	if e, ok := s.state.Invalids[authKey]; ok && e.Active {
+		return true
+	}
+	if e, ok := s.state.Bans[authKey]; ok && e.Active {
+		// If Models is empty, it's an account-wide ban
+		if len(e.Models) == 0 {
+			return true
+		}
+		// Otherwise check if this specific model (or its prefix group) is banned
+		for _, m := range e.Models {
+			if modelBanMatches(m, model) {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
 func (s *banStore) activeBans() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -265,6 +348,33 @@ func (s *banStore) activeBans() []string {
 	for key, e := range s.state.Bans {
 		if e.Active {
 			keys = append(keys, key)
+		}
+	}
+	for key, e := range s.state.Invalids {
+		if e.Active {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+func (s *banStore) activeBansForModel(model string) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var keys []string
+	for key, e := range s.state.Bans {
+		if !e.Active {
+			continue
+		}
+		if len(e.Models) == 0 {
+			keys = append(keys, key)
+		} else {
+			for _, m := range e.Models {
+				if modelBanMatches(m, model) {
+					keys = append(keys, key)
+					break
+				}
+			}
 		}
 	}
 	for key, e := range s.state.Invalids {
@@ -738,8 +848,9 @@ func handleUsage(rec usageRecord) []byte {
 
 	if status == http.StatusTooManyRequests {
 		resetAt := parseResetAt(rec.Failure.Body, now)
-		store.addBan(authKey, "429 quota exceeded", status, resetAt)
-		return okJSON(map[string]any{"stored": true, "action": "banned", "reset_at": resetAt})
+		banModel := normalizeModelBan(rec.Model)
+		store.addBan(authKey, "429 quota exceeded", status, resetAt, banModel)
+		return okJSON(map[string]any{"stored": true, "action": "banned", "reset_at": resetAt, "model": banModel})
 	}
 
 	if status == http.StatusUnauthorized || status == http.StatusForbidden {
@@ -770,7 +881,8 @@ func handleSchedulerPick(req schedulerPickRequest) ([]byte, error) {
 
 	store.load()
 
-	activeBans := store.activeBans()
+	model := strings.TrimSpace(req.Model)
+	activeBans := store.activeBansForModel(model)
 	if len(activeBans) == 0 {
 		return okJSON(schedulerPickResponse{Handled: false}), nil
 	}
@@ -874,7 +986,7 @@ func handleManagement(req managementRequest) managementResponse {
 		banned := 0
 		for _, key := range body.Items {
 			if !store.isActiveBan(key) {
-				store.addBan(key, "manual ban", 0, 0)
+				store.addBan(key, "manual ban", 0, 0, "")
 				banned++
 			}
 		}
